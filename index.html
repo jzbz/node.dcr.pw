@@ -13,7 +13,7 @@
 #
 # Optional environment overrides:
 #   DCR_VERSION=v2.1.5        Pin a specific release instead of "latest"
-#   DCR_SKIP_REINSTALL=1      Skip reinstalling when that version is already present
+#   DCR_SKIP_REINSTALL=1      Skip the download and check when that version is already present
 #   DCR_SKIP_GPG=1            Skip GPG signature verification (NOT recommended)
 #   DCR_SKIP_SPACE_CHECK=1    Skip the free-disk-space preflight check
 #   GITHUB_TOKEN=...          Avoid GitHub API rate limits (60 req/hr unauthenticated)
@@ -268,7 +268,7 @@ pkg_for_cmd() {
 # Name of the system package manager, or non-zero if none is supported.
 pkg_manager() {
     local m
-    for m in apt-get dnf yum pacman apk; do
+    for m in apt-get dnf yum pacman; do
         if command -v "$m" >/dev/null 2>&1; then
             echo "$m"
             return 0
@@ -294,7 +294,6 @@ install_pkgs() {
         # `-Sy <pkg>` risks a partial upgrade on Arch (installs against a newer
         # DB without upgrading deps); a full sync+upgrade is the supported path.
         pacman) pacman -Syu --needed --noconfirm "$@" ;;
-        apk) apk add --no-cache "$@" ;;
     esac
 }
 
@@ -371,7 +370,10 @@ detect_arch() {
 # list; printf is a shell builtin, so the token never reaches an argv.
 gh_curl() {
     local url="$1"; shift
-    local -a opts=(-sSfL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 15)
+    # --speed-*: give up on a transfer that stalls (under 1 KB/s for 60s)
+    # instead of hanging forever; a merely slow one is left alone.
+    local -a opts=(-sSfL --proto '=https' --proto-redir '=https' --retry 3
+                   --connect-timeout 15 --speed-limit 1024 --speed-time 60)
     if [ -n "${GITHUB_TOKEN:-}" ] && [[ "$url" == https://api.github.com/* ]]; then
         local hdr="${TMP_DIR}/gh_auth_header"
         ( umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$hdr" )
@@ -508,6 +510,15 @@ stage_binaries() {
     [ "$found_dcrd" -eq 1 ] || die "dcrd binary not found after extraction."
 }
 
+# Returns 0 when every staged binary is byte-identical to the installed one.
+# Anything else, a missing cmp included, reads as changed and reinstalls.
+binaries_unchanged() {
+    local path
+    for path in "${STAGED_BINS[@]}"; do
+        cmp -s "$path" "${BIN_DIR}/${path##*/}" || return 1
+    done
+}
+
 install_binaries() {
     log_message "Installing binaries to ${BIN_DIR}..."
     local path b
@@ -528,7 +539,8 @@ install_binaries() {
 setup_user_and_dirs() {
     if ! id -u "$DCR_USER" >/dev/null 2>&1; then
         log_message "Creating system user '$DCR_USER'..."
-        useradd -r -m -d "$DCR_HOME" -s /usr/sbin/nologin "$DCR_USER"
+        # -M: the data directory is created below, without /etc/skel in it.
+        useradd -r -M -d "$DCR_HOME" -s /usr/sbin/nologin "$DCR_USER"
     else
         log_message "User '$DCR_USER' already exists."
     fi
@@ -723,30 +735,36 @@ main() {
     detect_arch
     resolve_version
 
-    # A rerun reinstalls by default, so the binaries on disk are always ones
-    # this run downloaded and verified against the signed manifest.
-    if already_installed; then
-        if [ "${DCR_SKIP_REINSTALL:-0}" = "1" ]; then
-            log_message "dcrd ${VERSION} is already installed and DCR_SKIP_REINSTALL=1 is set; ensuring service config only."
-            setup_user_and_dirs
-            write_service
-            write_status_script
-            start_service
-            print_summary
-            return 0
+    local have=0 swap=0
+    already_installed && have=1
+
+    # A rerun downloads and verifies by default, so the binaries on disk are
+    # always ones checked against the signed manifest. They are replaced, and
+    # the node bounced, only when they differ from that verified set.
+    if [ "$have" -eq 1 ] && [ "${DCR_SKIP_REINSTALL:-0}" = "1" ]; then
+        log_message "dcrd ${VERSION} is already installed and DCR_SKIP_REINSTALL=1 is set; ensuring service config only."
+    else
+        if [ "$have" -eq 1 ]; then
+            log_message "dcrd ${VERSION} is already installed; checking it against a fresh download. (DCR_SKIP_REINSTALL=1 to skip this.)"
         fi
-        log_message "dcrd ${VERSION} is already installed; reinstalling it. (DCR_SKIP_REINSTALL=1 to keep the existing binaries.)"
+        download_and_verify
+        stage_binaries
+        if binaries_unchanged; then
+            log_message "Installed binaries match the verified ${VERSION} release; leaving them in place."
+        else
+            swap=1
+        fi
     fi
 
-    # Download, verify, extract and prepare the account BEFORE stopping any
-    # running node, so the node is down only for the binary swap itself. A
-    # failure before the stop leaves it untouched; one after it restarts it
-    # (see cleanup).
-    download_and_verify
-    stage_binaries
+    # Everything above and the account setup run BEFORE any running node is
+    # stopped, so it is down only for the binary swap itself. A failure
+    # before the stop leaves it untouched; one after it restarts it (see
+    # cleanup).
     setup_user_and_dirs
-    stop_service_if_running
-    install_binaries
+    if [ "$swap" -eq 1 ]; then
+        stop_service_if_running
+        install_binaries
+    fi
     write_service
     write_status_script
     start_service
