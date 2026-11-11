@@ -44,6 +44,11 @@ NEEDS_RESTART=0
 # Set to 1 after the first `apt-get update`, so a second install pass in the
 # same run doesn't refresh the package lists again.
 APT_UPDATED=0
+# Extracted binaries waiting to be installed (filled by stage_binaries).
+STAGED_BINS=()
+# Set to 1 while this run has a previously running node stopped, so a failure
+# in that window can bring the node back up instead of leaving it offline.
+STOPPED_SERVICE=0
 
 decred_release_pubkey() {
     # Decred Release signing key, pinned in-script (fingerprint $DCR_RELEASE_FPR).
@@ -168,6 +173,18 @@ on_error() {
 trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 cleanup() {
+    local rc=$?
+    # A failure after the node was stopped must not leave it offline. Each
+    # binary is replaced atomically, so whatever is on disk is startable.
+    if [ "$rc" -ne 0 ] && [ "$STOPPED_SERVICE" -eq 1 ]; then
+        log_message "Setup failed while dcrd was stopped; starting it again..."
+        if systemctl start dcrd.service >/dev/null 2>&1; then
+            log_message "dcrd service is running again."
+        else
+            log_message "Warning: could not restart dcrd. Inspect with: journalctl -u dcrd -e"
+        fi
+    fi
+    rm -f "${BIN_DIR}/.dcrd.new" "${BIN_DIR}/.dcrctl.new" "${BIN_DIR}/.dcrwallet.new"
     # Best-effort: shut down the throwaway gpg agent and wipe the temp dir.
     if [ -n "${GNUPGHOME:-}" ] && [ -d "$GNUPGHOME" ]; then
         gpgconf --homedir "$GNUPGHOME" --kill gpg-agent >/dev/null 2>&1 || true
@@ -242,7 +259,8 @@ check_disk_space() {
 pkg_for_cmd() {
     case "$1" in
         gpg) echo "gnupg" ;;
-        sha256sum) echo "coreutils" ;;
+        sha256sum | install) echo "coreutils" ;;
+        find) echo "findutils" ;;
         *) echo "$1" ;;
     esac
 }
@@ -282,7 +300,7 @@ install_pkgs() {
 
 install_dependencies() {
     log_message "Checking required dependencies..."
-    local required=(curl jq gpg tar sha256sum)
+    local required=(curl jq gpg tar sha256sum find install)
     local missing_pkgs=()
     local cmd pkg
 
@@ -292,7 +310,7 @@ install_dependencies() {
         else
             log_message "'$cmd' is missing."
             pkg=$(pkg_for_cmd "$cmd")
-            # Avoid duplicate package names (e.g. gpg + sha256sum -> coreutils).
+            # Avoid duplicate package names (e.g. sha256sum + install -> coreutils).
             [[ " ${missing_pkgs[*]-} " == *" $pkg "* ]] || missing_pkgs+=("$pkg")
         fi
     done
@@ -308,6 +326,14 @@ install_dependencies() {
             command -v "$cmd" >/dev/null 2>&1 || die "Failed to install '$cmd'."
         done
         log_message "All dependencies installed successfully."
+    fi
+
+    # useradd ships under a different package name on every distribution, so
+    # it is checked rather than installed: better to name it here than to
+    # fail on it halfway through the install.
+    if ! id -u "$DCR_USER" >/dev/null 2>&1; then
+        command -v useradd >/dev/null 2>&1 \
+            || die "'useradd' is missing. Install it (package 'passwd', 'shadow-utils' or 'shadow') and rerun."
     fi
 
     install_sudo_if_missing
@@ -340,11 +366,16 @@ detect_arch() {
 # Wrapper around curl. Sends the GitHub token only to the API host: release
 # assets are public and redirect cross-host, where an Authorization header is
 # useless at best (modern curl strips it; old curl would leak it).
+# The header goes through a private file (`-H @file`, curl >= 7.55) rather
+# than the command line, where any local user could read it from the process
+# list; printf is a shell builtin, so the token never reaches an argv.
 gh_curl() {
     local url="$1"; shift
     local -a opts=(-sSfL --proto '=https' --proto-redir '=https' --retry 3 --connect-timeout 15)
     if [ -n "${GITHUB_TOKEN:-}" ] && [[ "$url" == https://api.github.com/* ]]; then
-        opts+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+        local hdr="${TMP_DIR}/gh_auth_header"
+        ( umask 077; printf 'Authorization: Bearer %s\n' "$GITHUB_TOKEN" > "$hdr" )
+        opts+=(-H "@${hdr}")
     fi
     curl "${opts[@]}" "$@" "$url"
 }
@@ -374,6 +405,7 @@ already_installed() {
 stop_service_if_running() {
     if systemctl is-active --quiet dcrd.service 2>/dev/null; then
         log_message "Stopping existing dcrd service to allow upgrade..."
+        STOPPED_SERVICE=1
         systemctl stop dcrd.service
         log_message "Service stopped."
     fi
@@ -455,8 +487,10 @@ verify_manifest_signature() {
     fi
 }
 
-install_binaries() {
-    log_message "Extracting and installing binaries to ${BIN_DIR}..."
+# Extract the archive and locate the binaries. Runs while any existing node is
+# still up, so a bad archive never costs it downtime.
+stage_binaries() {
+    log_message "Extracting binaries..."
     # --no-same-owner: as root, don't preserve whatever UIDs the archive holds.
     tar --no-same-owner -xzf "$TARBALL_PATH" -C "$TMP_DIR"
 
@@ -464,17 +498,29 @@ install_binaries() {
     for b in dcrd dcrctl dcrwallet; do
         path=$(find "$TMP_DIR" -type f -name "$b" -print -quit)
         if [ -n "$path" ]; then
-            install -m 0755 "$path" "${BIN_DIR}/${b}"
-            log_message "Installed ${b}."
+            STAGED_BINS+=("$path")
             [ "$b" = "dcrd" ] && found_dcrd=1
         else
             log_message "Note: '$b' not found in archive; skipping."
         fi
     done
 
-    if [ "$found_dcrd" -ne 1 ] || [ ! -x "${BIN_DIR}/dcrd" ]; then
-        die "dcrd binary not found after extraction."
-    fi
+    [ "$found_dcrd" -eq 1 ] || die "dcrd binary not found after extraction."
+}
+
+install_binaries() {
+    log_message "Installing binaries to ${BIN_DIR}..."
+    local path b
+    for path in "${STAGED_BINS[@]}"; do
+        b="${path##*/}"
+        # Copy next to the destination, then rename over it: the rename is
+        # atomic, so a failed copy never leaves a missing or partial binary.
+        install -m 0755 "$path" "${BIN_DIR}/.${b}.new"
+        mv -f "${BIN_DIR}/.${b}.new" "${BIN_DIR}/${b}"
+        log_message "Installed ${b}."
+    done
+
+    [ -x "${BIN_DIR}/dcrd" ] || die "dcrd binary missing from ${BIN_DIR} after install."
     NEEDS_RESTART=1
     log_message "Binaries installed successfully."
 }
@@ -624,6 +670,8 @@ start_service() {
     fi
 
     log_message "(Re)starting dcrd service..."
+    # From here a failure is reported below; cleanup need not start it again.
+    STOPPED_SERVICE=0
     # An immediate failure is surfaced by the poll below with journal context.
     systemctl restart dcrd.service || true
 
@@ -690,12 +738,15 @@ main() {
         log_message "dcrd ${VERSION} is already installed; reinstalling it. (DCR_SKIP_REINSTALL=1 to keep the existing binaries.)"
     fi
 
-    # Download and verify BEFORE stopping any running node, so a failed
-    # download or verification never leaves an existing node offline.
+    # Download, verify, extract and prepare the account BEFORE stopping any
+    # running node, so the node is down only for the binary swap itself. A
+    # failure before the stop leaves it untouched; one after it restarts it
+    # (see cleanup).
     download_and_verify
+    stage_binaries
+    setup_user_and_dirs
     stop_service_if_running
     install_binaries
-    setup_user_and_dirs
     write_service
     write_status_script
     start_service
